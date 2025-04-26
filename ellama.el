@@ -37,6 +37,7 @@
 
 (require 'eieio)
 (require 'llm)
+(require 'llm-custom)
 (require 'llm-provider-utils)
 (require 'compat)
 (eval-when-compile (require 'rx))
@@ -529,7 +530,7 @@ It should be a function with single argument generated text string."
       (replace-match "#+BEGIN_SRC\\1#+END_SRC"))
     (buffer-substring-no-properties (point-min) (point-max))))
 
-(defun ellama--replace (from to beg end)
+(defsubst ellama--replace (from to beg end)
   "Replace FROM to TO in region BEG END."
   (goto-char beg)
   (while (and
@@ -559,7 +560,7 @@ It should be a function with single argument generated text string."
   (when ellama-translate-italic
     (ellama--replace "_\\(.+?\\)_" "/\\1/" beg end))
   ;; lists
-  (ellama--replace "^\\* " "+ " beg end)
+  (ellama--replace "^\\* " "- " beg end)
   ;; strikethrough
   (ellama--replace "~~\\(.+?\\)~~" "+\\1+" beg end)
   (ellama--replace "<s>\\(.+?\\)</s>" "+\\1+" beg end)
@@ -893,7 +894,8 @@ If EPHEMERAL non nil new session will not be associated with any file."
                    (buffer-name (ellama-get-session-buffer id)))
       (remhash id ellama--active-sessions)
       (when (equal ellama--current-session-id id)
-	(setq ellama--current-session-id nil)))))
+	(setq ellama--current-session-id nil))))
+  (winner-undo))
 
 (defun ellama--get-session-file-name (file-name)
   "Get ellama session file name for FILE-NAME."
@@ -1734,13 +1736,140 @@ the full response text when the request completes (with BUFFER current)."
 		      (ellama-get-nick-prefix-for-mode) " " ellama-assistant-nick ":\n")
 	    (insert (ellama-context-format session) (ellama--fill-long-lines prompt) "\n\n"
 		    (ellama-get-nick-prefix-for-mode) " " ellama-assistant-nick ":\n"))
-	  (ellama-stream prompt
+	  (ellama-stream (ellama-convert-org-to-md prompt)
 			 :session session
 			 :system system
 			 :on-done (if donecb (list 'ellama-chat-done donecb)
 				    'ellama-chat-done)
 			 :filter (when (derived-mode-p 'org-mode)
 				   #'ellama--translate-markdown-to-org-filter)))))))
+
+(defun ellama-parse-interactions ()
+  "Parse the current buffer as a sequence of LLM interactions."
+  (unless (derived-mode-p 'org-mode)
+    (user-error "Can only parse org buffers"))
+  (let ((user-nick (concat (ellama-get-nick-prefix-for-mode) " " ellama-user-nick))
+        (asst-nick (concat (ellama-get-nick-prefix-for-mode) " " ellama-assistant-nick)))
+    (split-string (buffer-substring-no-properties (point-min) (point-max))
+                  (concat "^\\(?:"user-nick"\\|"""asst-nick"\\):") t "\\W+")))
+
+(defun ellama-add-assistant-nick ()
+  (goto-char (point-max))
+  (org-back-to-heading)
+  (when (looking-at (concat (ellama-get-nick-prefix-for-mode) " " ellama-user-nick ":"))
+    (org-insert-heading-respect-content)
+    (beginning-of-line)
+    (insert (concat (ellama-get-nick-prefix-for-mode) " " ellama-assistant-nick ":"))
+    (insert "\n")))
+
+(defun ellama-chat-from-current-buffer ()
+  "Start a new chat session with a system message created from the current buffer."
+  (interactive)
+  (setq llm-custom-full-interactions-flag t)
+  (auto-revert-mode -1)
+  (auto-save-mode -1)
+  (auto-fill-mode -1)
+  (ellama-add-assistant-nick)
+  (setq-local org-ctrl-c-ctrl-c-final-hook
+              (-concat org-ctrl-c-ctrl-c-final-hook '(ellama-chat-last-message-without-session)))
+  (ellama-stream-without-session))
+
+(defun ellama-chat-last-message-without-session ()
+  (interactive)
+  (ellama-add-assistant-nick)
+  (ellama-stream-without-session))
+
+(defun ellama-stream-without-session ()
+  (let* ((buffer (current-buffer))
+         (interactions
+          (with-current-buffer buffer (mapcar #'ellama-convert-org-to-md (ellama-parse-interactions))))
+         (reasoning-buffer (get-buffer-create
+			    (concat (make-temp-name "*ellama-reasoning-") "*")))
+         (insert-text
+	  (ellama--insert buffer (point) #'ellama--translate-markdown-to-org-filter))
+         (insert-reasoning
+	  (ellama--insert reasoning-buffer nil #'ellama--translate-markdown-to-org-filter))
+         (handler (ellama--handle-partial insert-text insert-reasoning reasoning-buffer))
+         (provider ellama-provider)
+         (donecb 'ellama-chat-done)
+         (errcb 'message)
+         (llm-prompt (llm-make-chat-prompt interactions))
+         (request (llm-custom-chat-streaming
+                   provider
+                   llm-prompt
+                   handler
+                   (lambda (response)
+		     (let ((text (plist-get response :text))
+			   (reasoning (plist-get response :reasoning)))
+		       (funcall handler response)
+		       (when (or ellama--current-session
+				 (not reasoning))
+			 (kill-buffer reasoning-buffer))
+		       (with-current-buffer buffer
+                         (accept-change-group ellama--change-group)
+			 (if (and (listp donecb)
+				  (functionp (car donecb)))
+			     (mapc (lambda (fn) (funcall fn text))
+				   donecb)
+			   (funcall donecb text))
+			 (when ellama-session-hide-org-quotes
+			   (ellama-collapse-org-quotes))
+                         (delete-trailing-whitespace))))
+                   (lambda (_ msg)
+		     (with-current-buffer buffer
+                       (cancel-change-group ellama--change-group)
+		       (funcall errcb msg)))
+                   t)))
+    (with-current-buffer buffer
+      (setq ellama--current-request request))))
+
+(defun ellama-add-screenshot-in-chat ()
+  (interactive)
+  (let* ((buf (get-buffer (ido-read-buffer "Buffer: " nil t)))
+         (is-src (with-current-buffer buf
+                   (derived-mode-p 'prog-mode)))
+         (template (if is-src
+                       (concat "SRC "
+                               (downcase (with-current-buffer buf mode-name)))
+                     "QUOTE")))
+    ;; (org-insert-structure-template template)
+    ;; (org-backward-element)
+    ;; (end-of-line)
+    (newline-and-indent)
+    (insert (concat "[[file://" (buffer-file-name buf) "]]"))))
+
+(defun ellama-add-data-pdf-other-window-in-chat ()
+  (interactive)
+  (let* ((buf (get-buffer (ido-read-buffer "Buffer: " nil t)))
+         (is-src (with-current-buffer buf
+                   (derived-mode-p 'prog-mode)))
+         (template (if is-src
+                       (concat "SRC "
+                               (downcase (with-current-buffer buf mode-name)))
+                     "QUOTE")))
+    ;; (org-insert-structure-template template)
+    ;; (org-backward-element)
+    ;; (end-of-line)
+    (newline-and-indent)
+    (insert (concat "[[file://" (buffer-file-name buf) "]]"))))
+
+
+;; CHECK: `ellama-convert-org-to-md' does not place code in ```code blocks```
+(defun ellama-insert-buffer-in-chat ()
+  (interactive)
+  (let* ((buf (get-buffer (ido-read-buffer "Buffer: " nil t)))
+         (is-src (with-current-buffer buf
+                   (derived-mode-p 'prog-mode)))
+         (template (if is-src
+                       (concat "SRC "
+                               (downcase (with-current-buffer buf mode-name)))
+                     "QUOTE")))
+    ;; (org-insert-structure-template template)
+    ;; (org-backward-element)
+    ;; (end-of-line)
+    (newline-and-indent)
+    (insert (concat "[[file://" (buffer-file-name buf) "]]"))))
+
 
 ;;;###autoload
 (defun ellama-chat-with-system-from-buffer ()
@@ -2416,7 +2545,7 @@ Call CALLBACK on result list of strings.  ARGS contains keys for fine control.
 	 (variants (mapcar #'car providers)))
     (setq ellama-provider
 	  (eval (alist-get
-		 (completing-read "Select model: " variants)
+		 (ido-completing-read "Select model: " variants)
 		 providers nil nil #'string=)))
     (setq ellama--current-session-id nil)))
 
