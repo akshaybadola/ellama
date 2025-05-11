@@ -1748,19 +1748,36 @@ the full response text when the request completes (with BUFFER current)."
   "Parse the current buffer as a sequence of LLM interactions."
   (unless (derived-mode-p 'org-mode)
     (user-error "Can only parse org buffers"))
-  (let ((user-nick (concat (ellama-get-nick-prefix-for-mode) " " ellama-user-nick))
-        (asst-nick (concat (ellama-get-nick-prefix-for-mode) " " ellama-assistant-nick)))
+  (let* ((user-nick (concat (ellama-get-nick-prefix-for-mode) " " ellama-user-nick))
+         (asst-nick (concat (ellama-get-nick-prefix-for-mode) " " ellama-assistant-nick))
+         (pat (eval `(rx (or ,user-nick ,asst-nick) ":"))))
     (split-string (buffer-substring-no-properties (point-min) (point-max))
-                  (concat "^\\(?:"user-nick"\\|"""asst-nick"\\):") t "\\W+")))
+                  pat t "[[:space:]]+")))
+
+(setq ellama-streaming-function #'llm-custom-python-chat-streaming)
 
 (defun ellama-add-assistant-nick ()
   (goto-char (point-max))
   (org-back-to-heading)
   (when (looking-at (concat (ellama-get-nick-prefix-for-mode) " " ellama-user-nick ":"))
     (org-insert-heading-respect-content)
-    (beginning-of-line)
-    (insert (concat (ellama-get-nick-prefix-for-mode) " " ellama-assistant-nick ":"))
+    (end-of-line)
+    (insert (concat ellama-assistant-nick ":"))
     (insert "\n")))
+
+(defun ellama-just-chat ()
+  (interactive)
+  (let* ((fname (concat (make-temp-name "ellama-") ".org")))
+    (find-file (concat (expand-file-name "~/.emacs.d/ellama-sessions/") fname))
+    (with-current-buffer fname
+      (insert "** User:\n")
+      (goto-char (point-max))
+      (org-mode)
+      (basic-save-buffer)
+      (setq-local org-ctrl-c-ctrl-c-final-hook
+                  '(ellama-chat-last-message-without-session))
+      (switch-to-buffer (current-buffer)))))
+
 
 (defun ellama-chat-from-current-buffer ()
   "Start a new chat session with a system message created from the current buffer."
@@ -1769,20 +1786,23 @@ the full response text when the request completes (with BUFFER current)."
   (auto-revert-mode -1)
   (auto-save-mode -1)
   (auto-fill-mode -1)
-  (ellama-add-assistant-nick)
   (setq-local org-ctrl-c-ctrl-c-final-hook
               (-concat org-ctrl-c-ctrl-c-final-hook '(ellama-chat-last-message-without-session)))
-  (ellama-stream-without-session))
+  (ellama-stream-without-session t))
 
 (defun ellama-chat-last-message-without-session ()
   (interactive)
   (ellama-add-assistant-nick)
-  (ellama-stream-without-session))
+  (prog1 t
+    (ellama-stream-without-session)))
 
-(defun ellama-stream-without-session ()
+(defun ellama-stream-without-session (&optional add-assistant-nick)
   (let* ((buffer (current-buffer))
          (interactions
-          (with-current-buffer buffer (mapcar #'ellama-convert-org-to-md (ellama-parse-interactions))))
+          (prog1
+              (with-current-buffer buffer (mapcar #'ellama-convert-org-to-md (ellama-parse-interactions)))
+            (when add-assistant-nick
+              (ellama-add-assistant-nick))))
          (reasoning-buffer (get-buffer-create
 			    (concat (make-temp-name "*ellama-reasoning-") "*")))
          (insert-text
@@ -1794,11 +1814,18 @@ the full response text when the request completes (with BUFFER current)."
          (donecb 'ellama-chat-done)
          (errcb 'message)
          (llm-prompt (llm-make-chat-prompt interactions))
-         (request (llm-custom-chat-streaming
+         (streaming-function (if (string-match-p "localhost" (llm-provider-chat-url ellama-provider))
+                                 ellama-streaming-function
+                               'llm-custom-chat-streaming))
+         (llm-custom-full-interactions-flag (not
+                                             (string-match-p "localhost\\|192.168.+"
+                                                             (llm-provider-chat-url ellama-provider))))
+         (request (funcall streaming-function
                    provider
                    llm-prompt
                    handler
                    (lambda (response)
+                     (message "GOT RESPONSE")
 		     (let ((text (plist-get response :text))
 			   (reasoning (plist-get response :reasoning)))
 		       (funcall handler response)
@@ -1816,27 +1843,37 @@ the full response text when the request completes (with BUFFER current)."
 			   (ellama-collapse-org-quotes))
                          (delete-trailing-whitespace))))
                    (lambda (_ msg)
+                     (message "GOT ERROR")
 		     (with-current-buffer buffer
                        (cancel-change-group ellama--change-group)
 		       (funcall errcb msg)))
                    t)))
     (with-current-buffer buffer
+      (goto-char (point-max))
       (setq ellama--current-request request))))
 
-(defun ellama-add-screenshot-in-chat ()
+(defun ellama-add-screenshot-other-window-in-chat ()
+  "Take screenshot of the vertical window on other side.
+
+The screenshot is taken with `spectacle' and cropped with graphicsmagick `gm'."
   (interactive)
-  (let* ((buf (get-buffer (ido-read-buffer "Buffer: " nil t)))
-         (is-src (with-current-buffer buf
-                   (derived-mode-p 'prog-mode)))
-         (template (if is-src
-                       (concat "SRC "
-                               (downcase (with-current-buffer buf mode-name)))
-                     "QUOTE")))
-    ;; (org-insert-structure-template template)
-    ;; (org-backward-element)
-    ;; (end-of-line)
-    (newline-and-indent)
-    (insert (concat "[[file://" (buffer-file-name buf) "]]"))))
+  (pcase-let* ((window (selected-window))
+               (other-window (util/get-or-create-window-on-side))
+               (`(,top ,left ,height ,length) (window-inside-absolute-pixel-edges other-window))
+               (proc (async-start
+                      (lambda ()
+                        (sleep-for .2)
+                        (shell-command
+                         (concat "spectacle -ban -o /tmp/screenshot.png && "
+                                 (format "gm mogrify -crop %dx%d+%d+%d /tmp/screenshot.png"
+                                         height length top left)))))))
+    (async-get proc))
+  (insert "[[/tmp/screenshot.png]]"))
+
+(defun ellama-insert-current-result ()
+  (interactive)
+  (insert (ellama--translate-markdown-to-org-filter
+           (plist-get llm-custom-current-result :text))))
 
 (defun ellama-add-data-pdf-other-window-in-chat ()
   (interactive)
@@ -1855,7 +1892,7 @@ the full response text when the request completes (with BUFFER current)."
 
 
 ;; CHECK: `ellama-convert-org-to-md' does not place code in ```code blocks```
-(defun ellama-insert-buffer-in-chat ()
+(defun ellama-insert-code-buffer-in-chat ()
   (interactive)
   (let* ((buf (get-buffer (ido-read-buffer "Buffer: " nil t)))
          (is-src (with-current-buffer buf
@@ -1869,6 +1906,26 @@ the full response text when the request completes (with BUFFER current)."
     ;; (end-of-line)
     (newline-and-indent)
     (insert (concat "[[file://" (buffer-file-name buf) "]]"))))
+
+(defun ellama-insert-project-files-in-chat ()
+  (interactive)
+  (let* ((project-root (ido-read-directory-name "Project root: "))
+         (files (let ((default-directory project-root))
+                  (split-string (shell-command-to-string "git ls-files")))))
+    (seq-do (lambda (file)
+              (let* ((buf (find-file-noselect file))
+                     (is-src (with-current-buffer buf
+                               (derived-mode-p 'prog-mode)))
+                     (template (if is-src
+                                   (concat "SRC "
+                                           (downcase (with-current-buffer buf mode-name)))
+                                 "QUOTE")))
+                (newline-and-indent)
+                (insert (format "~%s~\n" file))
+                (org-indent-line)
+                (insert (concat "[[file://" (f-join project-root file) "]]\n\n"))
+                (org-indent-line)))
+            files)))
 
 
 ;;;###autoload
