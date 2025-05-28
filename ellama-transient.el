@@ -38,6 +38,8 @@
   :type 'ingeger
   :group 'ellama)
 
+(defvar ellama-use-ollama-p nil
+  "Avoid ollama don't exist errors in the transient main menu.")
 (defvar ellama-transient-ollama-model-name "")
 (defvar ellama-transient-temperature 0.7)
 (defvar ellama-transient-context-length 4096)
@@ -417,6 +419,8 @@ ARGS used for transient arguments."
    ("-e" "Create Ephemeral Session" "--ephemeral")]
   ["Main"
    [("c" "Chat" ellama-transient-chat)
+    ("j" "Chat Custom" ellama-custom-chat)
+    ("J" "Chat Custom Select Provider" ellama-custom-chat-select-provider)
     ("b" "Chat with blueprint" ellama-blueprint-select)
     ("B" "Blueprint Commands" ellama-transient-blueprint-menu)]
    [("a" "Ask Commands" ellama-transient-ask-menu)
@@ -433,6 +437,8 @@ ARGS used for transient arguments."
     ("m" "Make Commands" ellama-transient-make-menu)]]
   ["System"
    [("o" "Ollama model" ellama-select-ollama-model)
+    ("I" "Model info" ellama-custom-model-info)
+    ("l" "List models" ellama-custom-list-models)
     ("p" "Provider selection" ellama-provider-select)
     ("y" "Set system message" ellama-transient-set-system
      :transient t
@@ -446,7 +452,7 @@ ARGS used for transient arguments."
   [["Quit" ("q" "Quit" transient-quit-one)]]
   (interactive)
   (transient-setup 'ellama-transient-main-menu)
-  (when (string-empty-p ellama-transient-ollama-model-name)
+  (when (and ellama-use-ollama-p (string-empty-p ellama-transient-ollama-model-name))
     (ellama-fill-transient-ollama-model ellama-provider)))
 
 ;;;###autoload (autoload 'ellama "ellama-transient" nil t)

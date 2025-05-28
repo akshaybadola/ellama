@@ -35,6 +35,8 @@
 
 ;;; Code:
 
+(require 'a)
+(require 'async)
 (require 'eieio)
 (require 'llm)
 (require 'llm-custom)
@@ -1570,9 +1572,9 @@ Extract profession from this message. Be short and concise."
   "Scroll within BUFFER.
 Go to POINT before start scrolling if provided.  A function for
 programmatically scrolling the buffer during text generation."
-  (when-let ((ellama-auto-scroll)
-	     (buf (or buffer (current-buffer)))
-	     (window (get-buffer-window buf)))
+  (when-let* ((ellama-auto-scroll)
+	      (buf (or buffer (current-buffer)))
+	      (window (get-buffer-window buf)))
     (with-selected-window window
       (when (ellama-chat-buffer-p buf)
 	(goto-char (point-max)))
@@ -1754,7 +1756,7 @@ the full response text when the request completes (with BUFFER current)."
     (split-string (buffer-substring-no-properties (point-min) (point-max))
                   pat t "[[:space:]]+")))
 
-(setq ellama-streaming-function #'llm-custom-python-chat-streaming)
+(setq ellama-custom-streaming-function #'llm-custom-python-chat-streaming)
 
 (defun ellama-add-assistant-nick ()
   (goto-char (point-max))
@@ -1765,21 +1767,40 @@ the full response text when the request completes (with BUFFER current)."
     (insert (concat ellama-assistant-nick ":"))
     (insert "\n")))
 
-(defun ellama-just-chat ()
+(defun ellama-custom-interrupt ()
+  "Interrupt the current ellama custom request.
+
+If called from current buffer, interrupt that, else interrupt the
+current global provider request."
   (interactive)
-  (let* ((fname (concat (make-temp-name "ellama-") ".org")))
+  (let ((provider ellama-provider))
+    (llm-custom-interrupt provider)))
+
+(defun ellama-custom-chat-select-provider ()
+  (interactive)
+  (ellama-custom-chat 4))
+
+(defun ellama-custom-chat (&optional select-provider)
+  (interactive "p")
+  (let* ((provider (if (eq select-provider 4)
+                       (let ((provider-name (ido-completing-read
+                                             "Select model: "
+                                             (mapcar #'car ellama-providers))))
+                         (a-get ellama-providers provider-name))
+                     ellama-provider))
+         (fname (concat (make-temp-name "ellama-") ".org")))
     (find-file (concat (expand-file-name "~/.emacs.d/ellama-sessions/") fname))
     (with-current-buffer fname
       (insert "** User:\n")
       (goto-char (point-max))
       (org-mode)
+      (auto-fill-mode -1)
       (basic-save-buffer)
+      (setq-local ellama-provider provider)
       (setq-local org-ctrl-c-ctrl-c-final-hook
-                  '(ellama-chat-last-message-without-session))
-      (switch-to-buffer (current-buffer)))))
+                  '(ellama-custom-chat-send-last-message)))))
 
-
-(defun ellama-chat-from-current-buffer ()
+(defun ellama-custom-chat-from-current-buffer ()
   "Start a new chat session with a system message created from the current buffer."
   (interactive)
   (setq llm-custom-full-interactions-flag t)
@@ -1787,82 +1808,91 @@ the full response text when the request completes (with BUFFER current)."
   (auto-save-mode -1)
   (auto-fill-mode -1)
   (setq-local org-ctrl-c-ctrl-c-final-hook
-              (-concat org-ctrl-c-ctrl-c-final-hook '(ellama-chat-last-message-without-session)))
-  (ellama-stream-without-session t))
+              (-concat org-ctrl-c-ctrl-c-final-hook '(ellama-chat-send-last-message)))
+  (ellama-custom-stream t))
 
-(defun ellama-chat-last-message-without-session ()
+(defun ellama-custom-chat-send-last-message ()
   (interactive)
-  (ellama-add-assistant-nick)
   (prog1 t
-    (ellama-stream-without-session)))
+    (ellama-custom-stream t)))
 
-(defun ellama-stream-without-session (&optional add-assistant-nick)
+(defun ellama-custom-stream (&optional add-assistant-nick)
   (let* ((buffer (current-buffer))
-         (interactions
-          (prog1
-              (with-current-buffer buffer (mapcar #'ellama-convert-org-to-md (ellama-parse-interactions)))
-            (when add-assistant-nick
-              (ellama-add-assistant-nick))))
-         (reasoning-buffer (get-buffer-create
-			    (concat (make-temp-name "*ellama-reasoning-") "*")))
+         (interactions (prog1
+                           (with-current-buffer buffer
+                             (mapcar #'ellama-convert-org-to-md (ellama-parse-interactions)))
+                         (when add-assistant-nick
+                           (ellama-add-assistant-nick))))
+         (provider ellama-provider)
+         (streaming-function (if (string= (llm-name provider) "Custom")
+                                 ellama-custom-streaming-function
+                               'llm-custom-chat-streaming))
+         (reasoning-buffer (unless (eq streaming-function 'llm-custom-python-chat-streaming)
+                             (get-buffer-create
+			      (concat (make-temp-name "*ellama-reasoning-") "*"))))
          (insert-text
 	  (ellama--insert buffer (point) #'ellama--translate-markdown-to-org-filter))
          (insert-reasoning
-	  (ellama--insert reasoning-buffer nil #'ellama--translate-markdown-to-org-filter))
-         (handler (ellama--handle-partial insert-text insert-reasoning reasoning-buffer))
-         (provider ellama-provider)
+	  (when reasoning-buffer
+            (ellama--insert reasoning-buffer nil #'ellama--translate-markdown-to-org-filter)))
          (donecb 'ellama-chat-done)
          (errcb 'message)
          (llm-prompt (llm-make-chat-prompt interactions))
-         (streaming-function (if (string-match-p "localhost" (llm-provider-chat-url ellama-provider))
-                                 ellama-streaming-function
-                               'llm-custom-chat-streaming))
+         (handler (if (eq streaming-function 'llm-custom-python-chat-streaming)
+                      'ellama--translate-markdown-to-org-filter
+                    (ellama--handle-partial insert-text insert-reasoning reasoning-buffer)))
          (llm-custom-full-interactions-flag (not
                                              (string-match-p "localhost\\|192.168.+"
-                                                             (llm-provider-chat-url ellama-provider))))
+                                                             (llm-provider-chat-url provider))))
          (request (funcall streaming-function
-                   provider
-                   llm-prompt
-                   handler
-                   (lambda (response)
-                     (message "GOT RESPONSE")
-		     (let ((text (plist-get response :text))
-			   (reasoning (plist-get response :reasoning)))
-		       (funcall handler response)
-		       (when (or ellama--current-session
-				 (not reasoning))
-			 (kill-buffer reasoning-buffer))
-		       (with-current-buffer buffer
-                         (accept-change-group ellama--change-group)
-			 (if (and (listp donecb)
-				  (functionp (car donecb)))
-			     (mapc (lambda (fn) (funcall fn text))
-				   donecb)
-			   (funcall donecb text))
-			 (when ellama-session-hide-org-quotes
-			   (ellama-collapse-org-quotes))
-                         (delete-trailing-whitespace))))
-                   (lambda (_ msg)
-                     (message "GOT ERROR")
-		     (with-current-buffer buffer
-                       (cancel-change-group ellama--change-group)
-		       (funcall errcb msg)))
-                   t)))
+                           provider
+                           llm-prompt
+                           handler
+                           (lambda (response)
+		             (let ((text (plist-get response :text))
+			           (reasoning (plist-get response :reasoning)))
+		               (funcall handler response)
+		               (when (or ellama--current-session
+				         (not reasoning))
+			         (kill-buffer reasoning-buffer))
+		               (with-current-buffer buffer
+                                 (accept-change-group ellama--change-group)
+			         (if (and (listp donecb)
+				          (functionp (car donecb)))
+			             (mapc (lambda (fn) (funcall fn text))
+				           donecb)
+			           (funcall donecb text))
+			         (when ellama-session-hide-org-quotes
+			           (ellama-collapse-org-quotes))
+                                 (delete-trailing-whitespace))))
+                           (lambda (_ msg)
+		             (with-current-buffer buffer
+                               (cancel-change-group ellama--change-group)
+		               (funcall errcb msg)))
+                           t)))
     (with-current-buffer buffer
       (goto-char (point-max))
-      (setq ellama--current-request request))))
+      (setq-local ellama--current-request request))))
+
+(defun ellama-custom-list-models ()
+  "Wrapper for `llm-custom-list-models'"
+  (interactive)
+  (llm-custom-list-models))
+
+(defun ellama-custom-model-info ()
+  "Wrapper for `llm-custom-model-info'"
+  (interactive)
+  (llm-custom-model-info))
 
 (defun ellama-add-screenshot-other-window-in-chat ()
   "Take screenshot of the vertical window on other side.
 
 The screenshot is taken with `spectacle' and cropped with graphicsmagick `gm'."
   (interactive)
-  (pcase-let* ((window (selected-window))
-               (other-window (util/get-or-create-window-on-side))
+  (pcase-let* ((other-window (util/get-or-create-window-on-side))
                (`(,top ,left ,height ,length) (window-inside-absolute-pixel-edges other-window))
                (proc (async-start
                       (lambda ()
-                        (sleep-for .2)
                         (shell-command
                          (concat "spectacle -ban -o /tmp/screenshot.png && "
                                  (format "gm mogrify -crop %dx%d+%d+%d /tmp/screenshot.png"
@@ -2547,7 +2577,7 @@ Call CALLBACK on result list of strings.  ARGS contains keys for fine control.
 
 (defun ellama-embedding-model-p (name)
   "Check if NAME is an embedding model."
-  (when-let ((model (llm-models-match name)))
+  (when-let* ((model (llm-models-match name)))
     (not (not (member 'embedding (llm-model-capabilities model))))))
 
 (defun ellama-get-ollama-chat-model-names ()
