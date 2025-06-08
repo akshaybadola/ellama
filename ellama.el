@@ -1842,8 +1842,7 @@ current global provider request."
                       'ellama--translate-markdown-to-org-filter
                     (ellama--handle-partial insert-text insert-reasoning reasoning-buffer)))
          (llm-custom-full-interactions-flag (not
-                                             (string-match-p "localhost\\|192.168.+"
-                                                             (llm-provider-chat-url provider))))
+                                             (string-match-p "gemma3" (llm-custom-chat-model provider))))
          (request (funcall streaming-function
                            provider
                            llm-prompt
@@ -1873,6 +1872,28 @@ current global provider request."
     (with-current-buffer buffer
       (goto-char (point-max))
       (setq-local ellama--current-request request))))
+
+(defvar ellama-custom-current-models nil)
+
+(defun ellama-custom-switch-model ()
+  "Wrapper for `llm-custom-list-models'"
+  (interactive)
+  (unless ellama-custom-current-models
+    (setq ellama-custom-current-models (llm-custom-list-models t)))
+  (let* ((available-models (seq-map 'identity ellama-custom-current-models))
+         (choices
+          (-keep (lambda (x) (or (and (a-get (cdr x) 'model_name)
+                                      (-any (lambda (y)
+                                              (string-match-p (a-get (cdr x) 'model_name) y))
+                                            available-models)
+                                      (car x))
+                                 (and (a-get (cdr x) 'model_path)
+                                      (member (a-get (cdr x) 'model_path) available-models)
+                                      (car x))))
+                 ellama-custom-models-config))
+         (selected (ido-completing-read "Select model: " choices))
+         (params (a-get ellama-custom-models-config selected)))
+    (llm-custom-switch-model selected params ellama-provider)))
 
 (defun ellama-custom-list-models ()
   "Wrapper for `llm-custom-list-models'"
@@ -2634,7 +2655,8 @@ Call CALLBACK on result list of strings.  ARGS contains keys for fine control.
 	  (eval (alist-get
 		 (ido-completing-read "Select model: " variants)
 		 providers nil nil #'string=)))
-    (setq ellama--current-session-id nil)))
+    (setq ellama--current-session-id nil)
+    (setq ellama-custom-current-models (llm-custom-list-models t))))
 
 ;;;###autoload
 (defun ellama-chat-translation-enable ()

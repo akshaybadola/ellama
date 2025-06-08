@@ -431,13 +431,15 @@ ARGS used for transient arguments."
     ("k" "Text Complete" ellama-complete)
     ("g" "Text change" ellama-change)
     ("d" "Define word" ellama-define-word)]
-   [("s" "Summarize Commands" ellama-transient-summarize-menu)
-    ("i" "Improve Commands" ellama-transient-improve-menu)
+   [("sm" "Switch Custom Model" ellama-custom-switch-model)
+    ("ss" "Summarize" ellama-transient-summarize-menu)
+    ("I" "Improve Commands" ellama-transient-improve-menu)
     ("t" "Translate Commands" ellama-transient-translate-menu)
     ("m" "Make Commands" ellama-transient-make-menu)]]
   ["System"
    [("o" "Ollama model" ellama-select-ollama-model)
-    ("I" "Model info" ellama-custom-model-info)
+    ("im" "Model info" ellama-custom-model-info)
+    ("ii" "Model info" ellama-custom-interrupt)
     ("l" "List models" ellama-custom-list-models)
     ("p" "Provider selection" ellama-provider-select)
     ("y" "Set system message" ellama-transient-set-system
