@@ -1546,12 +1546,15 @@ Extract profession from this message. Be short and concise."
 (defun ellama-convert-org-to-md (text)
   "Translate TEXT from org syntax to markdown syntax."
   (require 'ox)
-  (require 'ox-md)
+  (require 'ox-gfm)
   (let ((buf (make-temp-name "ellama-"))
 	(org-export-show-temporary-export-buffer nil))
     (with-temp-buffer
+      (org-mode)
       (insert "#+OPTIONS: toc:nil broken-links:mark\n" text)
-      (org-export-to-buffer 'md buf
+      ;; (insert text)
+      ;; (org-export-to-buffer 'gfm buf nil nil nil nil '(:with-toc nil)))
+      (org-export-to-buffer 'gfm buf
 	nil nil t t nil (lambda () (text-mode))))
     (with-current-buffer buf
       (prog1
@@ -1752,7 +1755,7 @@ the full response text when the request completes (with BUFFER current)."
     (user-error "Can only parse org buffers"))
   (let* ((user-nick (concat (ellama-get-nick-prefix-for-mode) " " ellama-user-nick))
          (asst-nick (concat (ellama-get-nick-prefix-for-mode) " " ellama-assistant-nick))
-         (pat (eval `(rx (or ,user-nick ,asst-nick) ":"))))
+         (pat (eval `(rx (seq line-start (or ,user-nick ,asst-nick) ":")))))
     (split-string (buffer-substring-no-properties (point-min) (point-max))
                   pat t "[[:space:]]+")))
 
@@ -1800,7 +1803,11 @@ current global provider request."
       (setq-local org-ctrl-c-ctrl-c-final-hook
                   '(ellama-custom-chat-send-last-message)))))
 
-(defun ellama-custom-chat-from-current-buffer ()
+(defun ellama-custom-chat-from-current-buffer-clear ()
+  (interactive)
+  (ellama-custom-chat-from-current-buffer t))
+
+(defun ellama-custom-chat-from-current-buffer (&optional clear-chat)
   "Start a new chat session with a system message created from the current buffer."
   (interactive)
   (setq llm-custom-full-interactions-flag t)
@@ -1809,6 +1816,8 @@ current global provider request."
   (auto-fill-mode -1)
   (setq-local org-ctrl-c-ctrl-c-final-hook
               (-concat org-ctrl-c-ctrl-c-final-hook '(ellama-chat-send-last-message)))
+  (when clear-chat
+    (setf (alist-get (buffer-name) llm-custom-python-combined-result nil nil 'equal) nil))
   (ellama-custom-stream t))
 
 (defun ellama-custom-chat-send-last-message ()
@@ -1841,8 +1850,9 @@ current global provider request."
          (handler (if (eq streaming-function 'llm-custom-python-chat-streaming)
                       'ellama--translate-markdown-to-org-filter
                     (ellama--handle-partial insert-text insert-reasoning reasoning-buffer)))
-         (llm-custom-full-interactions-flag (not
-                                             (string-match-p "gemma3" (llm-custom-chat-model provider))))
+         (llm-custom-full-interactions-flag
+          (or (not (string= (llm-name provider) "Custom"))
+              (not (string-match-p "gemma3" (llm-custom-chat-model provider)))))
          (request (funcall streaming-function
                            provider
                            llm-prompt
@@ -1928,13 +1938,7 @@ The screenshot is taken with `spectacle' and cropped with graphicsmagick `gm'."
 
 (defun ellama-add-data-pdf-other-window-in-chat ()
   (interactive)
-  (let* ((buf (get-buffer (ido-read-buffer "Buffer: " nil t)))
-         (is-src (with-current-buffer buf
-                   (derived-mode-p 'prog-mode)))
-         (template (if is-src
-                       (concat "SRC "
-                               (downcase (with-current-buffer buf mode-name)))
-                     "QUOTE")))
+  (let* ((buf (get-buffer (ido-read-buffer "Buffer: " nil t))))
     ;; (org-insert-structure-template template)
     ;; (org-backward-element)
     ;; (end-of-line)
@@ -1945,13 +1949,7 @@ The screenshot is taken with `spectacle' and cropped with graphicsmagick `gm'."
 ;; CHECK: `ellama-convert-org-to-md' does not place code in ```code blocks```
 (defun ellama-insert-code-buffer-in-chat ()
   (interactive)
-  (let* ((buf (get-buffer (ido-read-buffer "Buffer: " nil t)))
-         (is-src (with-current-buffer buf
-                   (derived-mode-p 'prog-mode)))
-         (template (if is-src
-                       (concat "SRC "
-                               (downcase (with-current-buffer buf mode-name)))
-                     "QUOTE")))
+  (let* ((buf (get-buffer (ido-read-buffer "Buffer: " nil t))))
     ;; (org-insert-structure-template template)
     ;; (org-backward-element)
     ;; (end-of-line)
@@ -1959,23 +1957,37 @@ The screenshot is taken with `spectacle' and cropped with graphicsmagick `gm'."
     (insert (concat "[[file://" (buffer-file-name buf) "]]"))))
 
 (defun ellama-insert-project-files-in-chat ()
+  "Insert all files in project recursively.
+
+The project root is read from the minibuffer."
+  (interactive)
+  (let* ((project-root (expand-file-name (ido-read-directory-name "Project root: ")))
+         (extension (read-from-minibuffer "Extension: "))
+         (files (let ((default-directory project-root))
+                  (-filter (lambda (x) (string-match-p (concat ".*" (regexp-quote extension)) x))
+                           (split-string (shell-command-to-string "git ls-files"))))))
+    (seq-do (lambda (file)
+              (newline-and-indent)
+              (insert (format "~%s~\n" file))
+              (org-indent-line)
+              (insert (concat "[[file://" (f-join project-root file) "]]\n\n"))
+              (org-indent-line))
+            files)))
+
+(defun ellama-insert-files-recursive-in-chat ()
+  "Insert files recursively from given directory matching regexp.
+
+The directory path is read from the minibuffer."
   (interactive)
   (let* ((project-root (ido-read-directory-name "Project root: "))
-         (files (let ((default-directory project-root))
-                  (split-string (shell-command-to-string "git ls-files")))))
+         (files (let ((extension (read-from-minibuffer "Extension: ")))
+                  (directory-files-recursively project-root (concat ".*" extension "$")))))
     (seq-do (lambda (file)
-              (let* ((buf (find-file-noselect file))
-                     (is-src (with-current-buffer buf
-                               (derived-mode-p 'prog-mode)))
-                     (template (if is-src
-                                   (concat "SRC "
-                                           (downcase (with-current-buffer buf mode-name)))
-                                 "QUOTE")))
-                (newline-and-indent)
-                (insert (format "~%s~\n" file))
-                (org-indent-line)
-                (insert (concat "[[file://" (f-join project-root file) "]]\n\n"))
-                (org-indent-line)))
+              (newline-and-indent)
+              (insert (format "~%s~\n" file))
+              (org-indent-line)
+              (insert (concat "[[file://" (f-join project-root file) "]]\n\n"))
+              (org-indent-line))
             files)))
 
 

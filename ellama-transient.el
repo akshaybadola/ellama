@@ -418,7 +418,9 @@ ARGS used for transient arguments."
    :if (lambda () ellama-session-auto-save)
    ("-e" "Create Ephemeral Session" "--ephemeral")]
   ["Main"
-   [("c" "Chat" ellama-transient-chat)
+   [("ce" "Chat" ellama-transient-chat)
+    ("cj" "Custom Chat" ellama-custom-chat-from-current-buffer)
+    ("cc""Custom Chat Clear" ellama-custom-chat-from-current-buffer-clear)
     ("j" "Chat Custom" ellama-custom-chat)
     ("J" "Chat Custom Select Provider" ellama-custom-chat-select-provider)
     ("b" "Chat with blueprint" ellama-blueprint-select)
@@ -439,7 +441,7 @@ ARGS used for transient arguments."
   ["System"
    [("o" "Ollama model" ellama-select-ollama-model)
     ("im" "Model info" ellama-custom-model-info)
-    ("ii" "Model info" ellama-custom-interrupt)
+    ("ii" "Interrupt Custom Generation" ellama-custom-interrupt)
     ("l" "List models" ellama-custom-list-models)
     ("p" "Provider selection" ellama-provider-select)
     ("y" "Set system message" ellama-transient-set-system
